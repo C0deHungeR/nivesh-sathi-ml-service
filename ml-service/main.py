@@ -1,8 +1,28 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, model_validator
 import pandas as pd
 import numpy as np
 import pickle
+
+# ======================================================
+# FASTAPI APP (CREATE ONCE)
+# ======================================================
+app = FastAPI(title="NiveshSathi ML Service (Production Safe)")
+
+# ======================================================
+# CORS CONFIG (REQUIRED FOR BROWSER REQUESTS)
+# ======================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],   # Enables OPTIONS
+    allow_headers=["*"],
+)
 
 # ======================================================
 # CONFIG (REALISTIC FINANCIAL BOUNDS)
@@ -20,8 +40,12 @@ UI_TO_DATASET_CATEGORY = {
     "Small Cap": "Equity",
     "Hybrid": "Hybrid",
     "Debt": "Debt",
-    "All Categories": None
+    "All Categories": None,
 }
+
+# ======================================================
+# OPTIONAL MODEL WRAPPER (SAFE)
+# ======================================================
 class TFWrapper:
     def __init__(self, model):
         self.model = model
@@ -29,11 +53,10 @@ class TFWrapper:
     def predict(self, X):
         return self.model.predict(X)
 
-
 # ======================================================
 # LOAD MODEL & PREPROCESSOR
 # ======================================================
-model = pickle.load(open("xgb_model.pkl", "rb"))          # PyTorch or TF wrapped model
+model = pickle.load(open("xgb_model.pkl", "rb"))
 preprocessor = pickle.load(open("preprocessor.pkl", "rb"))
 
 # ======================================================
@@ -45,7 +68,7 @@ df.replace("-", np.nan, inplace=True)
 numeric_cols = [
     "min_sip", "min_lumpsum", "expense_ratio", "fund_size_cr",
     "fund_age_yr", "sortino", "alpha", "sd", "beta",
-    "sharpe", "returns_1yr"
+    "sharpe", "returns_1yr",
 ]
 
 for col in numeric_cols:
@@ -53,31 +76,26 @@ for col in numeric_cols:
 
 df.dropna(
     subset=["scheme_name", "amc_name", "category", "returns_1yr"],
-    inplace=True
+    inplace=True,
 )
 
-# ❗ Never recommend negative growth schemes
+# Never recommend negative-return schemes
 df = df[df["returns_1yr"] > 0]
 
 BASE_RETURN = df["returns_1yr"].median()
 
 # ======================================================
-# FASTAPI APP
-# ======================================================
-app = FastAPI(title="NiveshSathi ML Service (Production Safe)")
-
-# ======================================================
-# INPUT SCHEMA (Pydantic v2 SAFE)
+# INPUT SCHEMA (Pydantic v2)
 # ======================================================
 class InvestorInput(BaseModel):
     amc_name: str
     category: str
     investment_amount: float | None = None   # Lumpsum
     sip_amount: float | None = None          # SIP
-    tenure: int                              # years (<=50)
+    tenure: int                              # years
 
     @model_validator(mode="after")
-    def validate_investment_mode(self):
+    def validate_inputs(self):
         if self.investment_amount and self.sip_amount:
             raise ValueError("Choose either lump sum OR SIP, not both.")
         if not self.investment_amount and not self.sip_amount:
@@ -94,16 +112,14 @@ def map_risk_level(rank: int) -> str:
         return "Low"
     elif rank <= 4:
         return "Medium"
-    else:
-        return "High"
+    return "High"
 
 # ======================================================
-# MONTE CARLO (1-YEAR, REALISTIC)
+# MONTE CARLO SIMULATION
 # ======================================================
 def monte_carlo(mean_return, volatility, tenure, n=1000):
     mean_return = np.clip(mean_return, MIN_RETURN, MAX_RETURN)
 
-    # Long-term investors experience smoother volatility
     tenure_factor = max(0.5, min(1.0, 5 / tenure))
     adjusted_vol = volatility * tenure_factor
 
@@ -113,8 +129,15 @@ def monte_carlo(mean_return, volatility, tenure, n=1000):
     return {
         "expected": round(float(np.mean(sims)), 2),
         "best_case": round(float(np.percentile(sims, 90)), 2),
-        "worst_case": round(float(np.percentile(sims, 10)), 2)
+        "worst_case": round(float(np.percentile(sims, 10)), 2),
     }
+
+# ======================================================
+# HEALTH CHECK (OPTIONAL BUT USEFUL)
+# ======================================================
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # ======================================================
 # PREDICTION ENDPOINT
@@ -124,21 +147,18 @@ def predict(data: InvestorInput):
 
     mapped_category = UI_TO_DATASET_CATEGORY.get(data.category)
 
-    # --------------------------------------------------
-    # FILTERING (AMC + LUMPSUM OR SIP)
-    # --------------------------------------------------
     filtered = df[df["amc_name"] == data.amc_name]
 
     if data.investment_amount:
         filtered = filtered[
-            (filtered["min_lumpsum"].isna()) |
-            (filtered["min_lumpsum"] <= data.investment_amount)
+            filtered["min_lumpsum"].isna()
+            | (filtered["min_lumpsum"] <= data.investment_amount)
         ]
 
     if data.sip_amount:
         filtered = filtered[
-            (filtered["min_sip"].isna()) |
-            (filtered["min_sip"] <= data.sip_amount)
+            filtered["min_sip"].isna()
+            | (filtered["min_sip"] <= data.sip_amount)
         ]
 
     if mapped_category:
@@ -147,59 +167,37 @@ def predict(data: InvestorInput):
     if filtered.empty:
         return {"error": "No suitable schemes found"}
 
-    # --------------------------------------------------
-    # QUALITY FILTERS (ROBUSTNESS)
-    # --------------------------------------------------
     filtered = filtered[
-        (filtered["fund_age_yr"] >= 3) &
-        (filtered["expense_ratio"] < 3)
-    ]
+        (filtered["fund_age_yr"] >= 3)
+        & (filtered["expense_ratio"] < 3)
+    ].copy()
 
-    # --------------------------------------------------
-    # ADDED: Clip extreme past returns to avoid outliers dominating sort
-    # --------------------------------------------------
-    filtered = filtered.copy()  # Avoid SettingWithCopyWarning
-    filtered["returns_1yr"] = filtered["returns_1yr"].clip(upper=40)  # Realistic cap (adjustable)
+    filtered["returns_1yr"] = filtered["returns_1yr"].clip(upper=40)
 
-    # --------------------------------------------------
-    # ADDED: Smarter sorting – prioritize risk-adjusted metrics for Debt
-    # --------------------------------------------------
     if mapped_category == "Debt":
         filtered = filtered.sort_values(
             by=["sharpe", "sortino", "returns_1yr"],
-            ascending=False
+            ascending=False,
         ).head(10)
     else:
         filtered = filtered.sort_values(
             by=["returns_1yr", "sharpe"],
-            ascending=False
+            ascending=False,
         ).head(10)
 
     recommendations = []
 
-    # --------------------------------------------------
-    # ML + MONTE CARLO LOOP
-    # --------------------------------------------------
     for _, scheme in filtered.iterrows():
 
-        input_dict = {}
-        for col in preprocessor.feature_names_in_:
-            if col == "tenure":
-                input_dict[col] = data.tenure
-            elif col in scheme:
-                input_dict[col] = scheme[col]
-            else:
-                input_dict[col] = 0
+        input_dict = {
+            col: (data.tenure if col == "tenure" else scheme.get(col, 0))
+            for col in preprocessor.feature_names_in_
+        }
 
         X = preprocessor.transform(pd.DataFrame([input_dict]))
-        
-        # Model prediction (works for PyTorch or TF wrapper)
         delta = float(model.predict(X)[0])
 
-        # Base + delta (NO MULTIPLICATION)
         future_return = BASE_RETURN + delta
-
-        # Soft confidence boost for long-term investors
         if data.tenure >= 10:
             future_return += 1.0
         elif data.tenure >= 5:
@@ -207,16 +205,12 @@ def predict(data: InvestorInput):
 
         future_return = np.clip(future_return, MIN_RETURN, MAX_RETURN)
 
-        mc = monte_carlo(
-            future_return,
-            scheme["sd"],
-            data.tenure
-        )
+        mc = monte_carlo(future_return, scheme["sd"], data.tenure)
 
         score = (
-            0.5 * mc["expected"] +
-            0.3 * scheme["returns_1yr"] +
-            0.2 * scheme["sharpe"]
+            0.5 * mc["expected"]
+            + 0.3 * scheme["returns_1yr"]
+            + 0.2 * scheme["sharpe"]
         )
 
         recommendations.append({
@@ -226,15 +220,9 @@ def predict(data: InvestorInput):
             "best_case": mc["best_case"],
             "worst_case": mc["worst_case"],
             "risk": map_risk_level(int(scheme.get("risk_level", 4))),
-            "score": round(score, 2)
+            "score": round(score, 2),
         })
 
-    recommendations = sorted(
-        recommendations,
-        key=lambda x: x["score"],
-        reverse=True
-    )[:5]
+    recommendations.sort(key=lambda x: x["score"], reverse=True)
 
-    return {
-        "recommendations": recommendations
-    }
+    return {"recommendations": recommendations[:5]}
